@@ -1,0 +1,17 @@
+services:
+  ai-box-erp:
+    build: .
+    image: ai-box-erp:latest
+    container_name: ai-box-erp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8300
+    ports:
+      - "8300:8300"
+    # Lets the container reach a Postgres running on the Docker host:
+    # use DATABASE_URL=postgresql://USER:PASSWORD@host.docker.internal:5434/ai_box in .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
