@@ -1,0 +1,80 @@
+"""The login user's saved AI reports: save, list, open, delete. Nobody can reach another user's reports:
+every query is filtered by the caller's user id (security.current_user)."""
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.errors import ApiError
+from app.saved_reports import SavedReports
+from app.security import current_user
+
+# Public paths through the AI_python_backend gateway: /api/ai-box-erp/reports...
+router = APIRouter(prefix="/api/ai-box-erp/reports", tags=["Saved reports"])
+NO_STORE = {"Cache-Control": "no-store"}
+MAX_REPORT_BYTES = 2_000_000
+
+
+class SaveRequest(BaseModel):
+    """A report the user generated and chose to save, with what it was generated from."""
+    model_config = ConfigDict(extra="ignore")
+
+    verticalId: str = Field(min_length=1, max_length=20)
+    ReportCategoryId: int
+    ReportCategoryName: str | None = Field(default=None, max_length=200)
+    prompt: str = Field(min_length=1, max_length=2000)
+    filters: dict[str, Any] = {}
+    report: dict[str, Any]
+
+    @field_validator("report")
+    @classmethod
+    def _report(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value.get("title"), str) or not value["title"].strip():
+            raise ValueError("The report to save is not a generated AI report.")
+        return value
+
+
+def store(request: Request) -> SavedReports:
+    saved = getattr(request.app.state, "saved", None)
+    if saved is None:
+        raise ApiError(503, "Saved reports are not available right now. Please try again later.")
+    return saved
+
+
+@router.post("", status_code=201, summary="Save a generated report for the caller")
+async def save_report(body: SaveRequest, request: Request, user_id: str = Depends(current_user)) -> JSONResponse:
+    saved = store(request)
+    if len(json.dumps(body.report, ensure_ascii=False)) > MAX_REPORT_BYTES:
+        raise ApiError(413, "This report is too large to save.")
+    info = await saved.save(user_id=user_id, vertical_id=body.verticalId, category_id=body.ReportCategoryId,
+                            category_name=body.ReportCategoryName, prompt=body.prompt.strip(),
+                            filters=body.filters, report=body.report)
+    return JSONResponse(info, status_code=201, headers=NO_STORE)
+
+
+@router.get("", summary="The caller's saved reports, newest first")
+async def list_reports(request: Request, user_id: str = Depends(current_user),
+                       limit: int = Query(20, ge=1), offset: int = Query(0, ge=0),
+                       q: str = Query("", max_length=100)) -> JSONResponse:
+    saved = store(request)
+    limit = min(limit, request.app.state.ai_insights.s.SAVED_PAGE_MAX)
+    items, total = await saved.list(user_id, limit=limit, offset=offset, query=q.strip())
+    return JSONResponse({"items": items, "total": total}, headers=NO_STORE)
+
+
+@router.get("/{report_id}", summary="One of the caller's saved reports, with the full report JSON")
+async def get_report(report_id: int, request: Request, user_id: str = Depends(current_user)) -> JSONResponse:
+    found = await store(request).get(user_id, report_id)
+    if not found:
+        # Same answer for "not yours" and "does not exist": ids of other users' reports are not revealed.
+        raise ApiError(404, "This saved report was not found.")
+    return JSONResponse(found, headers=NO_STORE)
+
+
+@router.delete("/{report_id}", summary="Delete one of the caller's saved reports")
+async def delete_report(report_id: int, request: Request, user_id: str = Depends(current_user)) -> JSONResponse:
+    if not await store(request).delete(user_id, report_id):
+        raise ApiError(404, "This saved report was not found.")
+    return JSONResponse({"deleted": True}, headers=NO_STORE)

@@ -1,0 +1,127 @@
+"""Reads an ERP report file (xlsx or csv) into rows of {header: value}.
+
+The header row is the first row with at least MIN_HEADER_CELLS non-empty cells (the ERP files put it on
+row 1, but title rows above it are tolerated). Blank rows are skipped and never more than `max_rows`
+rows are read.
+"""
+from __future__ import annotations
+
+import csv
+import io
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+MIN_HEADER_CELLS = 3
+HEADER_SEARCH_ROWS = 20
+XLSX_TYPES = {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+CSV_TYPES = {"text/csv", "application/csv", "text/comma-separated-values", "application/vnd.ms-excel"}
+
+
+class ReportFileError(Exception):
+    pass
+
+
+@dataclass
+class ParsedFile:
+    headers: list[str]
+    rows: list[dict[str, Any]]
+    truncated: bool          # more data rows than max_rows
+
+
+def file_kind(name: str, content_type: str = "", content: bytes = b"") -> str | None:
+    """"xlsx", "csv" or None: the Content-Type first, then the extension, checked against the bytes."""
+    ctype = (content_type or "").lower()
+    lower = (name or "").lower()
+    if ctype in XLSX_TYPES:
+        kind = "xlsx"
+    elif ctype in CSV_TYPES and not lower.endswith(".xlsx"):
+        kind = "csv"
+    elif lower.endswith(".xlsx"):
+        kind = "xlsx"
+    elif lower.endswith(".csv"):
+        kind = "csv"
+    else:
+        kind = None
+    if content:
+        if content[:2] == b"PK":
+            return "xlsx"            # the bytes are a zip whatever the label says
+        if content[:4] == b"\xd0\xcf\x11\xe0":
+            return None              # legacy .xls (OLE), often labelled application/vnd.ms-excel
+        if kind == "xlsx":
+            return None
+    return kind
+
+
+def _cell(value: Any) -> Any:
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+def _table(lines: Iterable[Iterable[Any]], max_rows: int) -> ParsedFile:
+    headers: list[str] | None = None
+    rows: list[dict[str, Any]] = []
+    for index, raw in enumerate(lines):
+        values = [_cell(v) for v in raw]
+        filled = sum(v is not None for v in values)
+        if headers is None:
+            if filled >= MIN_HEADER_CELLS:
+                headers = [str(v) if v is not None else f"column_{i + 1}" for i, v in enumerate(values)]
+            elif index >= HEADER_SEARCH_ROWS:
+                break
+            continue
+        if not filled:
+            continue
+        if len(rows) >= max_rows:
+            return ParsedFile(headers, rows, truncated=True)
+        rows.append({h: v for h, v in zip(headers, values) if v is not None})
+    if headers is None:
+        raise ReportFileError("no header row was found")
+    return ParsedFile(headers, rows, truncated=False)
+
+
+def _xlsx(content: bytes, max_rows: int) -> ParsedFile:
+    from openpyxl import load_workbook
+    try:
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except Exception as exc:     # openpyxl raises many types (BadZipFile, InvalidFileException, KeyError...)
+        raise ReportFileError("it is not a readable Excel file") from exc
+    try:
+        last_error = None
+        for sheet in workbook.worksheets:
+            try:
+                return _table(sheet.iter_rows(values_only=True), max_rows)
+            except ReportFileError as exc:   # an empty or cover sheet: try the next one
+                last_error = exc
+        raise last_error or ReportFileError("the workbook has no sheets")
+    finally:
+        workbook.close()
+
+
+def _csv(content: bytes, max_rows: int) -> ParsedFile:
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            text = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ReportFileError("its text encoding is not supported")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        return _table(csv.reader(io.StringIO(text, newline=""), dialect), max_rows)
+    except csv.Error as exc:
+        raise ReportFileError("it is not a readable CSV file") from exc
+
+
+def parse(name: str, content_type: str, content: bytes, max_rows: int) -> ParsedFile:
+    kind = file_kind(name, content_type, content)
+    if kind == "xlsx":
+        return _xlsx(content, max_rows)
+    if kind == "csv":
+        return _csv(content, max_rows)
+    raise ReportFileError("it is not an xlsx or csv file")

@@ -1,0 +1,49 @@
+"""SavedReports against a real Postgres. Skipped unless TEST_DATABASE_URL is set, e.g.
+TEST_DATABASE_URL=postgresql://ai_box:...@127.0.0.1:5434/ai_box pytest tests/test_saved_reports_pg.py
+Uses its own schema and drops it afterwards."""
+import asyncio
+import os
+import uuid
+
+import pytest
+
+from app.saved_reports import SavedReports
+
+URL = os.environ.get("TEST_DATABASE_URL", "")
+pytestmark = pytest.mark.skipif(not URL, reason="TEST_DATABASE_URL is not set")
+
+REPORT = {"title": "First Mile Review", "generated_at": "2026-11-21T10:00:00+05:30",
+          "scope": {"period": "01 Oct 2026 – 31 Oct 2026", "records_analyzed": 6851}, "metrics": []}
+
+
+def test_reports_are_scoped_to_their_owner():
+    schema = f"ai_box_erp_test_{uuid.uuid4().hex[:8]}"
+    store = SavedReports(URL, schema)
+
+    async def scenario():
+        await store.open()
+        try:
+            a = await store.save(user_id="101", vertical_id="2", category_id=3, category_name="First Mile",
+                                 prompt="Pending pickups", filters={"fromDate": "2026-10-01"}, report=REPORT)
+            await store.save(user_id="202", vertical_id="2", category_id=3, category_name="First Mile",
+                             prompt="Other user", filters={}, report=REPORT)
+
+            items, total = await store.list("101", limit=10, offset=0)
+            assert total == 1 and items[0]["id"] == a["id"]
+            assert items[0]["period"] == "01 Oct 2026 – 31 Oct 2026" and items[0]["records_analyzed"] == 6851
+            assert (await store.list("101", limit=10, offset=0, query="pickups"))[1] == 1
+            assert (await store.list("101", limit=10, offset=0, query="nothing"))[1] == 0
+
+            assert (await store.get("101", a["id"]))["report"] == REPORT
+            assert await store.get("202", a["id"]) is None
+            assert await store.delete("202", a["id"]) is False
+            assert await store.delete("101", a["id"]) is True
+
+            assert await store.claim_token("hash-1", "101") is True
+            assert await store.claim_token("hash-1", "101") is True
+            assert await store.claim_token("hash-1", "202") is False
+        finally:
+            await asyncio.to_thread(store._run, f"DROP SCHEMA {schema} CASCADE")
+            await store.close()
+
+    asyncio.run(scenario())

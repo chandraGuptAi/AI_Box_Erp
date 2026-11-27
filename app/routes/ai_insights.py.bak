@@ -1,0 +1,50 @@
+import json
+
+from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+
+from app.ai_insights.schemas import GenerateRequest
+from app.ai_insights.service import AiInsightsService, Upload
+from app.errors import ApiError, readable
+from app.security import panel_login
+
+# Public path through the AI_python_backend gateway: POST /api/ai-box-erp/generate.
+router = APIRouter(prefix="/api/ai-box-erp", tags=["AI Insights"])
+
+
+@router.post(
+    "/generate",
+    summary="AI insights report (JSON, rendered by the panel) for one report type, from the attached ERP report file",
+    response_class=JSONResponse,
+    responses={200: {"description": "The report: title, scope, executive_summary, metrics, charts, tables, "
+                                    "findings, recommendations, limitations"}},
+)
+async def generate(http: Request,
+                   request: str = Form(..., description="JSON: verticalId, ReportCategoryId, ReportCategoryName, "
+                                                        "prompt, statuses, fromDate, toDate, customerCode, "
+                                                        "sourceReportId, sourceReportName"),
+                   file: UploadFile | None = File(None, description="The ERP report file (xlsx or csv)"),
+                   _login: str = Depends(panel_login),
+                   x_user_id: str | None = Header(default=None)) -> JSONResponse:
+    # Generating does not save: the user saves a report with POST /api/ai-box-erp/reports.
+    try:
+        raw = json.loads(request)
+    except ValueError:
+        raise ApiError(422, "The request field must be valid JSON.") from None
+    if not isinstance(raw, dict):
+        raise ApiError(422, "The request field must be a JSON object.")
+    try:
+        body = GenerateRequest.model_validate(raw)
+    except ValidationError as exc:
+        raise ApiError(422, readable(exc.errors())) from None
+
+    service: AiInsightsService = http.app.state.ai_insights
+    upload = None
+    if file is not None and (file.filename or file.size):
+        limit = int(service.s.MAX_UPLOAD_MB * 1024 * 1024)
+        content = await file.read(limit + 1)      # never hold more than the limit + 1 byte
+        upload = Upload(name=file.filename or "", content_type=file.content_type or "", content=content)
+
+    report = await service.generate(body, upload, requested_by=x_user_id)
+    return JSONResponse(report, headers={"Cache-Control": "no-store"})

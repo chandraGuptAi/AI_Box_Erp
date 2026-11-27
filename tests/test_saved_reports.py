@@ -1,0 +1,182 @@
+"""Saved reports: the user saves a generated report; it belongs to their X-User-Id, and no user can list,
+open or delete another user's reports. Uses an in-memory store; test_saved_reports_pg.py covers Postgres."""
+import itertools
+import json
+from datetime import datetime, timezone
+
+import pytest
+
+from tests.test_ai_insights import FM_FILE, TOKEN, make_env, payload
+
+
+class MemoryStore:
+    """Same contract as app.saved_reports.SavedReports."""
+
+    def __init__(self):
+        self.reports, self.tokens, self._ids = {}, {}, itertools.count(1)
+        self.runs, self._run_ids = {}, itertools.count(1)
+
+    async def record_run(self, run):
+        rid = next(self._run_ids)
+        self.runs[rid] = {**run, "id": rid, "saved_report_id": None}
+        return rid
+
+    async def claim_token(self, token_hash, user_id):
+        return self.tokens.setdefault(token_hash, user_id) == user_id
+
+    async def save(self, *, user_id, vertical_id, category_id, category_name, prompt, filters, report, run_id=None):
+        rid = next(self._ids)
+        run = self.runs.get(run_id)
+        if run and run["user_id"] == user_id:          # only the user's own run is linked
+            run["saved_report_id"] = rid
+        created = datetime(2026, 11, 21, 10, rid, tzinfo=timezone.utc).isoformat()
+        self.reports[rid] = {"id": rid, "user_id": user_id, "title": report.get("title"), "category_id": category_id,
+                             "category_name": category_name, "prompt": prompt, "filters": filters,
+                             "report": report, "created_at": created}
+        return {"id": rid, "created_at": created}
+
+    async def list(self, user_id, *, limit, offset, query=""):
+        mine = [r for r in self.reports.values() if r["user_id"] == user_id
+                and (not query or query.lower() in (r["title"] + r["prompt"]).lower())]
+        mine.sort(key=lambda r: r["created_at"], reverse=True)
+        page = [{k: r[k] for k in ("id", "title", "category_name", "prompt", "created_at")} for r in mine]
+        return page[offset:offset + limit], len(mine)
+
+    async def get(self, user_id, report_id):
+        r = self.reports.get(report_id)
+        return {k: v for k, v in r.items() if k != "user_id"} if r and r["user_id"] == user_id else None
+
+    async def delete(self, user_id, report_id):
+        r = self.reports.get(report_id)
+        if r and r["user_id"] == user_id:
+            del self.reports[report_id]
+            return True
+        return False
+
+
+@pytest.fixture
+def saved_env():
+    client, llm, app = make_env()
+    app.state.saved = MemoryStore()
+    yield client, app.state.saved
+    client.__exit__(None, None, None)
+
+
+def headers(user="101", token=TOKEN):
+    return {"Authorization": token, "X-User-Id": user}
+
+
+REPORT = {"title": "First Mile Review", "generated_at": "2026-11-21T10:00:00+05:30",
+          "scope": {"period": "01 Oct 2026 – 31 Oct 2026", "records_analyzed": 6851}}
+
+
+def save(client, user="101", token=TOKEN, prompt="Pending pickups", report=None):
+    body = {"verticalId": "2", "ReportCategoryId": 7, "ReportCategoryName": "First Mile", "prompt": prompt,
+            "filters": {"fromDate": "2026-10-01", "toDate": "2026-10-31", "statuses": []},
+            "report": report if report is not None else REPORT}
+    return client.post("/api/ai-box-erp/reports", json=body, headers=headers(user, token))
+
+
+def test_generating_does_not_save(saved_env):
+    client, store = saved_env
+    res = client.post("/api/ai-box-erp/generate", data={"request": json.dumps(payload())},
+                      files={"file": FM_FILE}, headers=headers())
+    assert res.status_code == 200, res.text
+    assert "id" not in res.json()
+    assert store.reports == {}
+
+
+def test_saving_a_report_stores_it_for_the_user(saved_env):
+    client, store = saved_env
+    res = save(client)
+    assert res.status_code == 201, res.text
+    assert res.json()["id"] == 1 and res.json()["created_at"]
+    stored = store.reports[1]
+    assert stored["user_id"] == "101"
+    assert stored["category_name"] == "First Mile"
+    assert stored["filters"]["fromDate"] == "2026-10-01"
+    assert stored["report"] == REPORT
+
+
+@pytest.mark.parametrize("report, status", [
+    ({"generated_at": "x"}, 422),                       # not a generated report (no title)
+    ({"title": "Big", "tables": ["x" * 2_100_000]}, 413),
+])
+def test_save_rejects_bad_reports(saved_env, report, status):
+    client, store = saved_env
+    res = save(client, report=report)
+    assert res.status_code == status
+    assert res.json()["message"]
+    assert store.reports == {}
+
+
+def test_users_only_see_their_own_reports(saved_env):
+    client, _ = saved_env
+    save(client, user="101", token="Bearer token-a")
+    save(client, user="101", token="Bearer token-a", prompt="Second report")
+    save(client, user="202", token="Bearer token-b")
+
+    mine = client.get("/api/ai-box-erp/reports", headers=headers("101", "Bearer token-a")).json()
+    assert mine["total"] == 2
+    assert {i["id"] for i in mine["items"]} == {1, 2}
+    theirs = client.get("/api/ai-box-erp/reports", headers=headers("202", "Bearer token-b")).json()
+    assert [i["id"] for i in theirs["items"]] == [3]
+
+
+def test_another_users_report_cannot_be_opened_or_deleted(saved_env):
+    client, store = saved_env
+    save(client, user="101", token="Bearer token-a")
+    other = headers("202", "Bearer token-b")
+    assert client.get("/api/ai-box-erp/reports/1", headers=other).status_code == 404
+    assert client.delete("/api/ai-box-erp/reports/1", headers=other).status_code == 404
+    assert 1 in store.reports
+
+    own = headers("101", "Bearer token-a")
+    opened = client.get("/api/ai-box-erp/reports/1", headers=own)
+    assert opened.status_code == 200 and opened.json()["report"] == REPORT
+    assert "user_id" not in opened.json()
+    assert client.delete("/api/ai-box-erp/reports/1", headers=own).json() == {"deleted": True}
+    assert client.get("/api/ai-box-erp/reports/1", headers=own).status_code == 404
+
+
+def test_a_login_token_cannot_be_reused_with_another_user_id(saved_env):
+    client, store = saved_env
+    assert client.get("/api/ai-box-erp/reports", headers=headers("101", "Bearer token-a")).status_code == 200
+    res = client.get("/api/ai-box-erp/reports", headers=headers("202", "Bearer token-a"))
+    assert res.status_code == 403
+    assert res.json()["message"] == "This login belongs to another user. Please log in again."
+    assert save(client, user="202", token="Bearer token-a").status_code == 403
+    assert store.reports == {}
+
+
+@pytest.mark.parametrize("hdrs, status", [
+    ({"Authorization": TOKEN}, 401),                          # no user id
+    ({"Authorization": TOKEN, "X-User-Id": "bad id!"}, 401),  # not a plain id
+    ({"X-User-Id": "101"}, 401),                              # no ERP login
+])
+def test_saved_reports_need_login_and_user_id(saved_env, hdrs, status):
+    client, _ = saved_env
+    assert client.get("/api/ai-box-erp/reports", headers=hdrs).status_code == status
+
+
+def test_search_and_paging(saved_env):
+    client, _ = saved_env
+    for i in range(3):
+        save(client, prompt=f"Courier check {i}")
+    page = client.get("/api/ai-box-erp/reports?limit=2&offset=0", headers=headers()).json()
+    assert page["total"] == 3 and len(page["items"]) == 2
+    found = client.get("/api/ai-box-erp/reports?q=check 1", headers=headers()).json()
+    assert [i["prompt"] for i in found["items"]] == ["Courier check 1"]
+
+
+def test_without_a_database_saved_reports_answer_503():
+    client, _, app = make_env()
+    app.state.saved = None
+    try:
+        assert client.get("/api/ai-box-erp/reports", headers=headers()).status_code == 503
+        assert save(client).status_code == 503
+        res = client.post("/api/ai-box-erp/generate", data={"request": json.dumps(payload())},
+                          files={"file": FM_FILE}, headers=headers())
+        assert res.status_code == 200                   # generating does not need the database
+    finally:
+        client.__exit__(None, None, None)

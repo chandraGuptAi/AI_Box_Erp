@@ -1,0 +1,66 @@
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.ai_insights.service import AiInsightsService
+from app.config import get_settings
+from app.errors import install_error_handlers
+from app.logger import get_logger, setup_logging
+from app.routes import ai_insights, export, health, saved_reports
+from app.saved_reports import SavedReports
+from app.security import service_token_middleware
+
+logger = get_logger("app")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    app.state.ai_insights = AiInsightsService(settings)
+    if not settings.LLM_API_KEY:
+        logger.warning("LLM_API_KEY is not set: /api/ai-box-erp/generate will answer 503")
+    # Tests may put their own store in app.state.saved before startup.
+    if getattr(app.state, "saved", None) is None:
+        app.state.saved = await _open_saved_reports(settings)
+    yield
+    store = app.state.saved
+    if isinstance(store, SavedReports):
+        await store.close()
+
+
+async def _open_saved_reports(settings) -> SavedReports | None:
+    if not settings.DATABASE_URL:
+        logger.warning("DATABASE_URL is not set: reports are not saved and /api/ai-box-erp/reports answers 503")
+        return None
+    store = SavedReports(settings.DATABASE_URL, settings.DB_SCHEMA)
+    try:
+        await store.open()
+    except Exception:
+        # Reports can still be generated; saving and the saved list wait for the database.
+        logger.exception("Saved reports database is unavailable")
+        await store.close()
+        return None
+    return store
+
+
+def create_app() -> FastAPI:
+    setup_logging()
+    settings = get_settings()
+    app = FastAPI(title=settings.APP_NAME, debug=settings.DEBUG, lifespan=lifespan)
+    app.middleware("http")(service_token_middleware)
+    install_error_handlers(app)
+    app.include_router(health.router)
+    app.include_router(ai_insights.router)
+    app.include_router(saved_reports.router)
+    app.include_router(export.router)
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    s = get_settings()
+    uvicorn.run("app.main:app", host=s.HOST, port=s.PORT, reload=s.DEBUG, timeout_graceful_shutdown=5)
